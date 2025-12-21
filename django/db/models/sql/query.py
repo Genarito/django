@@ -31,7 +31,7 @@ from django.db.models.expressions import (
     RawSQL,
     Ref,
     ResolvedOuterRef,
-    Value,
+    Value, SafeRef,
 )
 from django.db.models.fields import Field
 from django.db.models.lookups import Lookup
@@ -1345,8 +1345,12 @@ class Query(BaseExpression):
             )
             if annotation:
                 expression = self.annotations[annotation]
+                expression = self.annotations[annotation]
                 if summarize:
                     expression = Ref(annotation, expression)
+                else:
+                    expression = SafeRef(annotation, expression)
+                return expression_lookups, (), expression
                 return expression_lookups, (), expression
         _, field, _, lookup_parts = self.names_to_path(lookup_splitted, self.get_meta())
         field_parts = lookup_splitted[0 : len(lookup_splitted) - len(lookup_parts)]

@@ -1441,6 +1441,24 @@ class Ref(Expression):
         return [self]
 
 
+class SafeRef(Ref):
+    """
+    A wrapper around Ref that falls back to the source expression
+    if the alias is not available in the final query.
+    """
+    @property
+    def contains_aggregate(self):
+        return self.source.contains_aggregate
+
+    def get_group_by_cols(self, alias=None):
+        return self.source.get_group_by_cols()
+
+    def as_sql(self, compiler, connection):
+        if self.refs in compiler.query.annotation_select:
+            return super().as_sql(compiler, connection)
+        return self.source.as_sql(compiler, connection)
+
+
 class ExpressionList(Func):
     """
     An expression containing multiple expressions. Can be used to provide a
