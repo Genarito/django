@@ -1345,13 +1345,12 @@ class Query(BaseExpression):
             )
             if annotation:
                 expression = self.annotations[annotation]
-                expression = self.annotations[annotation]
                 if summarize:
                     expression = Ref(annotation, expression)
                 else:
                     expression = SafeRef(annotation, expression)
                 return expression_lookups, (), expression
-                return expression_lookups, (), expression
+
         _, field, _, lookup_parts = self.names_to_path(lookup_splitted, self.get_meta())
         field_parts = lookup_splitted[0 : len(lookup_splitted) - len(lookup_parts)]
         if len(lookup_parts) > 1 and not field_parts:
