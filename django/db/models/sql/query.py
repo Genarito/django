@@ -34,7 +34,7 @@ from django.db.models.expressions import (
     Value, SafeRef,
 )
 from django.db.models.fields import Field
-from django.db.models.lookups import Lookup
+from django.db.models.lookups import Lookup, Transform
 from django.db.models.query_utils import (
     Q,
     check_rel_lookup_compatibility,
@@ -318,6 +318,8 @@ class Query(BaseExpression):
         self.where = WhereNode()
         # Maps alias -> Annotation Expression.
         self.annotations = {}
+        # Maps alias -> Unresolved annotation expression.
+        self.annotation_sources = {}
         # These are for extensions. The contents are more or less appended
         # verbatim to the appropriate clause.
         self.extra = {}  # Maps col_alias -> (col_sql, params).
@@ -395,6 +397,7 @@ class Query(BaseExpression):
         obj.table_map = self.table_map.copy()
         obj.where = self.where.clone()
         obj.annotations = self.annotations.copy()
+        obj.annotation_sources = self.annotation_sources.copy()
         if self.annotation_select_mask is not None:
             obj.annotation_select_mask = self.annotation_select_mask.copy()
         if self.combined_queries:
@@ -586,6 +589,7 @@ class Query(BaseExpression):
                 outer_query.annotations[alias] = aggregate.replace_expressions(
                     replacements
                 )
+                outer_query.annotation_sources[alias] = aggregate
             if (
                 inner_query.select == ()
                 and not inner_query.default_cols
@@ -617,6 +621,7 @@ class Query(BaseExpression):
                 }
             else:
                 self.annotations = aggregates
+            self.annotation_sources = self.annotations.copy()
             self.set_annotation_mask(aggregates)
 
         empty_set_result = [
@@ -770,6 +775,25 @@ class Query(BaseExpression):
         # Combine subqueries aliases to ensure aliases relabelling properly
         # handle subqueries when combining where and select clauses.
         self.subq_aliases |= rhs.subq_aliases
+
+        # Align base table aliasing so combined filters don't reference
+        # stale aliases after rhs alias renaming.
+        rhs_base_alias = rhs.base_table
+        if rhs_base_alias and rhs_base_alias != initial_alias:
+            change_map[rhs_base_alias] = initial_alias
+        combined_change_map = dict(change_map)
+        rhs_alias_change_map = getattr(rhs, "_alias_change_map", None)
+        if rhs_alias_change_map:
+            # Preserve alias history across bump_prefix() + join relabeling.
+            for old_alias, intermediate_alias in rhs_alias_change_map.items():
+                combined_change_map.setdefault(
+                    old_alias, change_map.get(intermediate_alias, intermediate_alias)
+                )
+        if combined_change_map:
+            if hasattr(self, "_alias_change_map"):
+                self._alias_change_map.update(combined_change_map)
+            else:
+                self._alias_change_map = dict(combined_change_map)
 
         # Now relabel a copy of the rhs where-clause and add it to the current
         # one.
@@ -999,6 +1023,11 @@ class Query(BaseExpression):
         """
         if not change_map:
             return self
+        # Preserve alias renames to fix stale alias references in nested SQL.
+        if hasattr(self, "_alias_change_map"):
+            self._alias_change_map.update(change_map)
+        else:
+            self._alias_change_map = dict(change_map)
         # If keys and values of change_map were to intersect, an alias might be
         # updated twice (e.g. T4 -> T5, T5 -> T6, so also T4 -> T6) depending
         # on their order in change_map.
@@ -1015,6 +1044,10 @@ class Query(BaseExpression):
         self.annotations = self.annotations and {
             key: col.relabeled_clone(change_map)
             for key, col in self.annotations.items()
+        }
+        self.annotation_sources = self.annotation_sources and {
+            key: (col.relabeled_clone(change_map) if hasattr(col, "relabeled_clone") else col)
+            for key, col in self.annotation_sources.items()
         }
 
         # 2. Rename the alias in the internal table/alias datastructures.
@@ -1233,6 +1266,7 @@ class Query(BaseExpression):
     def add_annotation(self, annotation, alias, select=True):
         """Add a single annotation expression to the Query."""
         self.check_alias(alias)
+        self.annotation_sources[alias] = annotation
         annotation = annotation.resolve_expression(self, allow_joins=True, reuse=None)
         if select:
             self.append_annotation_mask([alias])
@@ -1348,7 +1382,11 @@ class Query(BaseExpression):
                 if summarize:
                     expression = Ref(annotation, expression)
                 else:
-                    expression = SafeRef(annotation, expression)
+                    if isinstance(expression, Transform):
+                        # Preserve transform-specific lookup behavior.
+                        expression = expression
+                    else:
+                        expression = SafeRef(annotation, expression)
                 return expression_lookups, (), expression
 
         _, field, _, lookup_parts = self.names_to_path(lookup_splitted, self.get_meta())
@@ -2377,6 +2415,7 @@ class Query(BaseExpression):
                 else:
                     group_by_annotations[alias] = expr
             self.annotations = {**group_by_annotations, **self.annotations}
+            self.annotation_sources = {**group_by_annotations, **self.annotation_sources}
             self.append_annotation_mask(group_by_annotations)
             self.select = tuple(values_select.values())
             self.values_select = tuple(values_select)
@@ -2620,6 +2659,15 @@ class Query(BaseExpression):
             return self._annotation_select_cache
         else:
             return self.annotations
+
+    def get_annotation_sources(self):
+        """
+        Return all annotation expressions before they are resolved.
+
+        The raw expressions are needed to detect inter-annotation dependencies
+        for CTE planning.
+        """
+        return self.annotation_sources
 
     @property
     def extra_select(self):

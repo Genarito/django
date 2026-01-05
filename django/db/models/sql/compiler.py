@@ -314,6 +314,8 @@ class SQLCompiler:
         col_idx = 1
         for col, alias in select:
             try:
+                previous_in_select = getattr(self, "in_select", False)
+                self.in_select = True
                 sql, params = self.compile(col)
             except EmptyResultSet:
                 empty_result_set_value = getattr(
@@ -328,6 +330,8 @@ class SQLCompiler:
                 sql, params = self.compile(Value(True))
             else:
                 sql, params = col.select_format(self, sql, params)
+            finally:
+                self.in_select = previous_in_select
             if alias is None and with_col_aliases:
                 alias = f"col{col_idx}"
                 col_idx += 1
@@ -641,6 +645,8 @@ class SQLCompiler:
             compiler.query = compiler.query.clone()
             compiler.query.set_values(selected)
         part_sql, part_args = compiler.as_sql(with_col_aliases=True)
+        if part_sql.lstrip().startswith("WITH "):
+            part_sql = "SELECT * FROM ({}) subquery".format(part_sql)
         if compiler.query.combinator:
             # Wrap in a subquery if wrapping in parentheses isn't
             # supported.
@@ -764,6 +770,7 @@ class SQLCompiler:
         refcounts_before = self.query.alias_refcount.copy()
         try:
             combinator = self.query.combinator
+            alias_replacements = {}
             extra_select, order_by, group_by = self.pre_sql_setup(
                 with_col_aliases=with_col_aliases or bool(combinator),
             )
@@ -772,6 +779,7 @@ class SQLCompiler:
             with_limit_offset = with_limits and self.query.is_sliced
             combinator = self.query.combinator
             features = self.connection.features
+            cte_change_map = {}
             if combinator:
                 if not getattr(features, "supports_select_{}".format(combinator)):
                     raise NotSupportedError(
@@ -786,14 +794,74 @@ class SQLCompiler:
                 result, params = self.get_qualify_sql()
                 order_by = None
             else:
+                # Check for annotation dependencies and generate CTEs if needed.
+                cte_annotations = self._get_cte_annotations()
+                cte_where = None
+                if cte_annotations and self.where:
+                    annotation_names = set(self.query.annotations)
+                    if not (self.where.get_refs() & annotation_names):
+                        cte_where = self.where
+                (
+                    cte_sql,
+                    cte_params,
+                    cte_table_map,
+                    cte_column_map,
+                ) = self._compile_cte_sql(
+                    cte_annotations, with_col_aliases, cte_where=cte_where
+                )
+                previous_cte_column_map = getattr(self, "cte_column_map", None)
+                self.cte_column_map = cte_column_map
+
                 distinct_fields, distinct_params = self.get_distinct()
                 # This must come after 'select', 'ordering', and 'distinct'
                 # (see docstring of get_from_clause() for details).
-                from_, f_params = self.get_from_clause()
+                if self.query.subquery:
+                    # Use external alias tracking to avoid masking internal aliases.
+                    external_ref_aliases = set(self.query.external_aliases)
+                    alias_replacements = {
+                        table_name: aliases[0]
+                        for table_name, aliases in self.query.table_map.items()
+                        if (
+                            len(aliases) == 1
+                            and aliases[0] != table_name
+                            and self.query.alias_refcount.get(aliases[0], 0) > 0
+                            and table_name not in external_ref_aliases
+                        )
+                    }
+                else:
+                    external_ref_aliases = set()
+                    alias_replacements = {}
+                if cte_table_map:
+                    # Use the last CTE as the source.
+                    last_cte = list(cte_table_map.values())[-1]
+                    last_cte_quoted = self.connection.ops.quote_name(last_cte)
+                    from_ = [last_cte_quoted]
+                    f_params = []
+
+                    # Build a change map to relabel column references from
+                    # original table alias to CTE.
+                    cte_change_map = {
+                        alias: last_cte
+                        for alias in self.query.alias_map
+                        if alias and alias != last_cte
+                    }
+                else:
+                    from_, f_params = self.get_from_clause()
+                    cte_change_map = {}
                 try:
-                    where, w_params = (
-                        self.compile(self.where) if self.where is not None else ("", [])
-                    )
+                    if cte_where is self.where:
+                        where, w_params = "", []
+                    else:
+                        previous_in_where = getattr(self, "in_where", False)
+                        self.in_where = True
+                        try:
+                            where, w_params = (
+                                self.compile(self.where)
+                                if self.where is not None
+                                else ("", [])
+                            )
+                        finally:
+                            self.in_where = previous_in_where
                 except EmptyResultSet:
                     if self.elide_empty:
                         raise
@@ -802,15 +870,26 @@ class SQLCompiler:
                 except FullResultSet:
                     where, w_params = "", []
                 try:
-                    having, h_params = (
-                        self.compile(self.having)
-                        if self.having is not None
-                        else ("", [])
-                    )
+                    previous_in_having = getattr(self, "in_having", False)
+                    self.in_having = True
+                    try:
+                        having, h_params = (
+                            self.compile(self.having)
+                            if self.having is not None
+                            else ("", [])
+                        )
+                    finally:
+                        self.in_having = previous_in_having
                 except FullResultSet:
                     having, h_params = "", []
-                result = ["SELECT"]
+                result = []
                 params = []
+
+                if cte_sql:
+                    result.append(cte_sql)
+                    params.extend(cte_params)
+
+                result.append("SELECT")
 
                 if self.query.distinct:
                     distinct_result, distinct_params = self.connection.ops.distinct_sql(
@@ -821,7 +900,38 @@ class SQLCompiler:
                     params += distinct_params
 
                 out_cols = []
+                cte_annotation_names = set(cte_table_map.keys())
                 for _, (s_sql, s_params), alias in self.select + extra_select:
+                    if alias and alias in cte_annotation_names:
+                        s_sql = self.connection.ops.quote_name(cte_column_map[alias])
+                        s_params = []
+                    elif cte_change_map:
+                        for old_alias, new_alias in cte_change_map.items():
+                            if old_alias and new_alias:
+                                old_quoted = self.connection.ops.quote_name(old_alias)
+                                new_quoted = self.connection.ops.quote_name(new_alias)
+                                s_sql = s_sql.replace(
+                                    f"{old_quoted}.", f"{new_quoted}."
+                                )
+                    if cte_column_map:
+                        for cte_alias, cte_col in cte_column_map.items():
+                            if cte_alias:
+                                cte_alias_quoted = self.connection.ops.quote_name(
+                                    cte_alias
+                                )
+                                cte_col_quoted = self.connection.ops.quote_name(
+                                    cte_col
+                                )
+                                s_sql = s_sql.replace(
+                                    cte_alias_quoted, cte_col_quoted
+                                )
+                    if alias_replacements:
+                        for old_alias, new_alias in alias_replacements.items():
+                            old_quoted = self.connection.ops.quote_name(old_alias)
+                            new_quoted = self.connection.ops.quote_name(new_alias)
+                            s_sql = s_sql.replace(
+                                f"{old_quoted}.", f"{new_quoted}."
+                            )
                     if alias:
                         s_sql = "%s AS %s" % (
                             s_sql,
@@ -891,11 +1001,60 @@ class SQLCompiler:
                     result.append(for_update_part)
 
                 if where:
+                    if cte_change_map:
+                        for old_alias, new_alias in cte_change_map.items():
+                            if old_alias and new_alias:
+                                old_quoted = self.connection.ops.quote_name(old_alias)
+                                new_quoted = self.connection.ops.quote_name(new_alias)
+                                where = where.replace(
+                                    f"{old_quoted}.", f"{new_quoted}."
+                                )
+                    if alias_replacements:
+                        for old_alias, new_alias in alias_replacements.items():
+                            old_quoted = self.connection.ops.quote_name(old_alias)
+                            new_quoted = self.connection.ops.quote_name(new_alias)
+                            where = where.replace(
+                                f"{old_quoted}.", f"{new_quoted}."
+                            )
+                    if external_ref_aliases and alias_replacements:
+                        for old_alias, new_alias in alias_replacements.items():
+                            if old_alias not in external_ref_aliases:
+                                continue
+                            old_quoted = self.connection.ops.quote_name(old_alias)
+                            new_quoted = self.connection.ops.quote_name(new_alias)
+                            pattern = (
+                                rf"{re.escape(new_quoted)}\.\"([^\"]+)\""
+                                rf"\s*([<>=!]+)\s*"
+                                rf"\({re.escape(new_quoted)}\.\"\1\"\)"
+                            )
+                            where = re.sub(
+                                pattern,
+                                lambda match: (
+                                    f'{new_quoted}."{match.group(1)}" '
+                                    f'{match.group(2)} ({old_quoted}."{match.group(1)}")'
+                                ),
+                                where,
+                            )
                     result.append("WHERE %s" % where)
                     params.extend(w_params)
 
                 grouping = []
                 for g_sql, g_params in group_by:
+                    if cte_change_map:
+                        for old_alias, new_alias in cte_change_map.items():
+                            if old_alias and new_alias:
+                                old_quoted = self.connection.ops.quote_name(old_alias)
+                                new_quoted = self.connection.ops.quote_name(new_alias)
+                                g_sql = g_sql.replace(
+                                    f"{old_quoted}.", f"{new_quoted}."
+                                )
+                    if alias_replacements:
+                        for old_alias, new_alias in alias_replacements.items():
+                            old_quoted = self.connection.ops.quote_name(old_alias)
+                            new_quoted = self.connection.ops.quote_name(new_alias)
+                            g_sql = g_sql.replace(
+                                f"{old_quoted}.", f"{new_quoted}."
+                            )
                     grouping.append(g_sql)
                     params.extend(g_params)
                 if grouping:
@@ -910,6 +1069,21 @@ class SQLCompiler:
                 if having:
                     if not grouping:
                         result.extend(self.connection.ops.force_group_by())
+                    if cte_change_map:
+                        for old_alias, new_alias in cte_change_map.items():
+                            if old_alias and new_alias:
+                                old_quoted = self.connection.ops.quote_name(old_alias)
+                                new_quoted = self.connection.ops.quote_name(new_alias)
+                                having = having.replace(
+                                    f"{old_quoted}.", f"{new_quoted}."
+                                )
+                    if alias_replacements:
+                        for old_alias, new_alias in alias_replacements.items():
+                            old_quoted = self.connection.ops.quote_name(old_alias)
+                            new_quoted = self.connection.ops.quote_name(new_alias)
+                            having = having.replace(
+                                f"{old_quoted}.", f"{new_quoted}."
+                            )
                     result.append("HAVING %s" % having)
                     params.extend(h_params)
 
@@ -925,6 +1099,21 @@ class SQLCompiler:
             if order_by:
                 ordering = []
                 for _, (o_sql, o_params, _) in order_by:
+                    if cte_change_map:
+                        for old_alias, new_alias in cte_change_map.items():
+                            if old_alias and new_alias:
+                                old_quoted = self.connection.ops.quote_name(old_alias)
+                                new_quoted = self.connection.ops.quote_name(new_alias)
+                                o_sql = o_sql.replace(
+                                    f"{old_quoted}.", f"{new_quoted}."
+                                )
+                    if alias_replacements:
+                        for old_alias, new_alias in alias_replacements.items():
+                            old_quoted = self.connection.ops.quote_name(old_alias)
+                            new_quoted = self.connection.ops.quote_name(new_alias)
+                            o_sql = o_sql.replace(
+                                f"{old_quoted}.", f"{new_quoted}."
+                            )
                     ordering.append(o_sql)
                     params.extend(o_params)
                 order_by_sql = "ORDER BY %s" % ", ".join(ordering)
@@ -979,6 +1168,416 @@ class SQLCompiler:
         finally:
             # Finally do cleanup - get rid of the joins we created above.
             self.query.reset_refcounts(refcounts_before)
+            if "previous_cte_column_map" in locals():
+                if previous_cte_column_map is None:
+                    delattr(self, "cte_column_map")
+                else:
+                    self.cte_column_map = previous_cte_column_map
+
+    def _get_annotation_references(self, expression, annotation_names):
+        """
+        Extract references to other annotations from an expression.
+
+        This drives CTE dependency discovery so dependent annotations are
+        evaluated in a separate step.
+        """
+        from django.db.models.expressions import When, SafeRef
+        from django.db.models.query_utils import refs_expression
+
+        refs = set()
+        if expression is None:
+            return refs
+
+        if isinstance(expression, F):
+            if isinstance(expression.name, str):
+                field_name = expression.name.split(LOOKUP_SEP)[0]
+                if field_name in annotation_names:
+                    refs.add(field_name)
+            return refs
+
+        if isinstance(expression, (Ref, SafeRef)):
+            if expression.refs in annotation_names:
+                refs.add(expression.refs)
+            if getattr(expression, "source", None) is not None:
+                refs |= self._get_annotation_references(
+                    expression.source, annotation_names
+                )
+            return refs
+
+        if isinstance(expression, tuple) and len(expression) == 2:
+            lookup, value = expression
+            if isinstance(lookup, str):
+                annotation, _ = refs_expression(
+                    lookup.split(LOOKUP_SEP),
+                    {name: True for name in annotation_names},
+                )
+                if annotation:
+                    refs.add(annotation)
+                if value is not None:
+                    refs |= self._get_annotation_references(value, annotation_names)
+                return refs
+
+        if isinstance(expression, Lookup):
+            if hasattr(expression, "lhs"):
+                refs |= self._get_annotation_references(
+                    expression.lhs, annotation_names
+                )
+            if hasattr(expression, "rhs"):
+                rhs = expression.rhs
+                if rhs is not None and hasattr(rhs, "resolve_expression"):
+                    refs |= self._get_annotation_references(rhs, annotation_names)
+            return refs
+
+        if isinstance(expression, When):
+            if getattr(expression, "condition", None) is not None:
+                refs |= self._get_annotation_references(
+                    expression.condition, annotation_names
+                )
+            if getattr(expression, "result", None) is not None:
+                refs |= self._get_annotation_references(
+                    expression.result, annotation_names
+                )
+            return refs
+
+        if hasattr(expression, "get_source_expressions"):
+            for source in expression.get_source_expressions():
+                if source is not None:
+                    refs |= self._get_annotation_references(source, annotation_names)
+
+        if hasattr(expression, "children"):
+            for child in expression.children:
+                if child is not None:
+                    refs |= self._get_annotation_references(child, annotation_names)
+
+        return refs
+
+    def _build_annotation_dependency_graph(self):
+        """
+        Build a dependency graph for annotations.
+        Returns:
+            - dependencies: dict mapping annotation name to set of annotations it depends on
+            - dependents: dict mapping annotation name to set of annotations that depend on it
+            - ordered_names: annotation names in declaration order
+
+        The graph is used to keep annotation evaluation order stable while
+        splitting dependent annotations into CTEs.
+        """
+        annotations = self.query.get_annotation_sources()
+        ordered_names = list(annotations.keys())
+
+        dependencies = {}
+        dependents = {}
+        for name in ordered_names:
+            dependencies[name] = set()
+            dependents[name] = set()
+
+        for idx, name in enumerate(ordered_names):
+            expression = annotations[name]
+            available_names = set(ordered_names[:idx])
+            refs = self._get_annotation_references(expression, available_names)
+            dependencies[name] = refs
+            for ref in refs:
+                dependents[ref].add(name)
+
+        return dependencies, dependents, ordered_names
+
+    def _get_cte_annotations(self):
+        """
+        Determine which annotations need to be in CTEs.
+        An annotation needs a CTE if it is referenced by another annotation.
+        Returns an ordered list of annotation names for CTE generation.
+
+        This avoids inlining dependent expressions multiple times in SELECT.
+        """
+        if not self.query.annotations:
+            return []
+
+        dependencies, dependents, ordered_names = (
+            self._build_annotation_dependency_graph()
+        )
+        annotations_with_subqueries = {
+            name
+            for name, expr in self.query.get_annotation_sources().items()
+            if getattr(expr, "contains_subquery", False)
+        }
+        annotations_with_aggregates = {
+            name
+            for name, expr in self.query.get_annotation_sources().items()
+            if getattr(expr, "contains_aggregate", False)
+        }
+
+        disallowed = set(annotations_with_subqueries) | set(
+            annotations_with_aggregates
+        )
+        changed = True
+        while changed:
+            changed = False
+            for name, deps in dependencies.items():
+                if name in disallowed:
+                    continue
+                if deps & disallowed:
+                    disallowed.add(name)
+                    changed = True
+
+        annotations_needing_cte = {
+            name
+            for name, deps in dependents.items()
+            if deps and name not in disallowed
+        } | {
+            name
+            for name, deps in dependencies.items()
+            if deps and name not in disallowed
+        }
+
+        if not annotations_needing_cte:
+            return []
+
+        result = []
+        visited = set()
+        temp_visited = set()
+
+        def visit(name):
+            if name in temp_visited:
+                raise ValueError(
+                    f"Circular dependency detected involving annotation '{name}'"
+                )
+            if name in visited:
+                return
+            if name not in annotations_needing_cte:
+                return
+
+            temp_visited.add(name)
+            for dep in dependencies[name]:
+                if dep in annotations_needing_cte:
+                    visit(dep)
+            temp_visited.remove(name)
+            visited.add(name)
+            result.append(name)
+
+        for name in ordered_names:
+            if name in annotations_needing_cte:
+                visit(name)
+
+        return result
+
+    def _compile_cte_sql(self, cte_annotations, with_col_aliases=False, cte_where=None):
+        """
+        Generate the CTE SQL for annotations that are referenced by other
+        annotations. Returns (cte_sql, cte_params, cte_table_map, cte_column_map).
+
+        CTEs keep dependent annotations materialized for reuse in later
+        annotations and the final SELECT.
+        """
+        if not cte_annotations:
+            return "", [], {}, {}
+
+        source_annotations = self.query.get_annotation_sources()
+        cte_parts = []
+        cte_params = []
+        cte_table_map = {}
+        cte_column_map = {}
+        previous_ctes = {}
+        previous_cte_names = []
+
+        for idx, name in enumerate(cte_annotations):
+            cte_name = f"_cte_{name}"
+            cte_col_name = f"_cte_col_{name}"
+            cte_table_map[name] = cte_name
+            cte_column_map[name] = cte_col_name
+
+            source_expr = self.query.annotations.get(name, source_annotations[name])
+            modified_expr = self._replace_annotation_refs_with_cte_refs(
+                source_expr, previous_ctes
+            )
+
+            inner_sql, inner_params = self._build_cte_inner_query(
+                name,
+                modified_expr,
+                previous_cte_names,
+                idx,
+                cte_col_name,
+                cte_where=cte_where,
+            )
+
+            cte_sql = f"{self.connection.ops.quote_name(cte_name)} AS ({inner_sql})"
+            cte_parts.append(cte_sql)
+            cte_params.extend(inner_params)
+
+            previous_ctes[name] = (cte_name, cte_col_name)
+            previous_cte_names.append(cte_name)
+
+        if cte_parts:
+            return (
+                "WITH " + ", ".join(cte_parts),
+                cte_params,
+                cte_table_map,
+                cte_column_map,
+            )
+        return "", [], {}, {}
+
+    def _build_cte_inner_query(
+        self,
+        annotation_name,
+        expression,
+        previous_cte_names,
+        cte_index,
+        cte_column_name,
+        cte_where=None,
+    ):
+        """
+        Build the inner query for a CTE.
+
+        Each inner query carries forward prior CTE columns so downstream
+        annotations can reference them.
+        """
+        if cte_index == 0 or not previous_cte_names:
+            from_clause, from_params = self.get_from_clause()
+            if from_clause:
+                from_sql = "FROM " + " ".join(from_clause)
+            else:
+                from_sql = ""
+        else:
+            last_cte_name = previous_cte_names[-1]
+            from_sql = f"FROM {self.connection.ops.quote_name(last_cte_name)}"
+            from_params = []
+            if expression is not None and self.query.base_table:
+                change_map = {self.query.base_table: last_cte_name}
+                if hasattr(expression, "relabeled_clone"):
+                    expression = expression.relabeled_clone(change_map)
+
+        try:
+            expr_sql, expr_params = self.compile(expression)
+        except EmptyResultSet:
+            expr_sql, expr_params = "NULL", []
+
+        where_sql = ""
+        where_params = []
+        if cte_where is not None and cte_index == 0:
+            try:
+                where_sql, where_params = self.compile(cte_where)
+            except EmptyResultSet:
+                where_sql, where_params = "0 = 1", []
+            except FullResultSet:
+                where_sql, where_params = "", []
+
+        select_cols = ["*"]
+        quoted_name = self.connection.ops.quote_name(cte_column_name)
+        select_cols.append(f"{expr_sql} AS {quoted_name}")
+
+        sql = f"SELECT {', '.join(select_cols)} {from_sql}"
+        if where_sql:
+            sql = f"{sql} WHERE {where_sql}"
+        params = list(expr_params) + list(from_params) + list(where_params)
+
+        return sql, params
+
+    def _replace_annotation_refs_with_cte_refs(self, expression, previous_ctes):
+        """
+        Replace references to annotations with references to CTE columns.
+
+        This preserves correct column bindings when an annotation is lifted
+        into a prior CTE.
+        """
+        from django.db.models.expressions import SafeRef
+        from django.db.models.query_utils import refs_expression
+
+        if expression is None:
+            return None
+
+        if isinstance(expression, (Ref, SafeRef)) and expression.refs in previous_ctes:
+            _, cte_col_name = previous_ctes[expression.refs]
+            source = self.query.annotations.get(expression.refs, expression.source)
+            return Ref(cte_col_name, source)
+
+        if isinstance(expression, F):
+            name = expression.name.split(LOOKUP_SEP)[0]
+            if name in previous_ctes:
+                _, cte_col_name = previous_ctes[name]
+                source = self.query.annotations.get(name, expression)
+                return Ref(cte_col_name, source)
+
+        if isinstance(expression, tuple) and len(expression) == 2:
+            lookup, value = expression
+            if isinstance(lookup, str):
+                annotation, lookups = refs_expression(
+                    lookup.split(LOOKUP_SEP),
+                    {name: True for name in previous_ctes},
+                )
+                if annotation:
+                    _, cte_col_name = previous_ctes[annotation]
+                    new_lookup = (
+                        LOOKUP_SEP.join([cte_col_name, *lookups])
+                        if lookups
+                        else cte_col_name
+                    )
+                    return (
+                        new_lookup,
+                        self._replace_annotation_refs_with_cte_refs(
+                            value, previous_ctes
+                        ),
+                    )
+                if value is not None:
+                    return (
+                        lookup,
+                        self._replace_annotation_refs_with_cte_refs(
+                            value, previous_ctes
+                        ),
+                    )
+            return expression
+
+        if hasattr(expression, "copy"):
+            expression = expression.copy()
+
+        if hasattr(expression, "set_source_expressions"):
+            new_source_expressions = []
+            for source in expression.get_source_expressions():
+                new_source_expressions.append(
+                    self._replace_annotation_refs_with_cte_refs(
+                        source, previous_ctes
+                    )
+                )
+            expression.set_source_expressions(new_source_expressions)
+
+        if hasattr(expression, "children"):
+            expression.children = [
+                self._replace_annotation_refs_with_cte_refs(child, previous_ctes)
+                for child in expression.children
+            ]
+
+        return expression
+
+    def _replace_stale_aliases(self, sql):
+        """
+        Repair stale alias references after alias relabeling in combined queries.
+
+        This also maps table names to the most-referenced alias when a table
+        is joined multiple times.
+        """
+        if not sql:
+            return sql
+        external_aliases = (
+            set(self.query.external_aliases) if self.query.external_aliases else set()
+        )
+        alias_map_keys = set(self.query.alias_map) | external_aliases
+        alias_change_map = getattr(self.query, "_alias_change_map", None) or {}
+        if not alias_change_map:
+            return sql
+        quoted_aliases = re.findall(r'"([A-Z]+[0-9]+)"\.', sql)
+        unquoted_aliases = re.findall(r'\b([A-Z]+[0-9]+)\."\w+"', sql)
+        stale_aliases = {
+            alias
+            for alias in quoted_aliases + unquoted_aliases
+            if alias not in alias_map_keys
+        }
+        if not stale_aliases:
+            return sql
+        for stale_alias in stale_aliases:
+            if not (replacement := alias_change_map.get(stale_alias)):
+                continue
+            if replacement in alias_map_keys:
+                sql = sql.replace(f'"{stale_alias}".', f'"{replacement}".')
+                sql = sql.replace(f"{stale_alias}.", f"{replacement}.")
+        return sql
 
     def get_default_columns(
         self, select_mask, start_alias=None, opts=None, from_parent=None

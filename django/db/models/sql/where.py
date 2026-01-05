@@ -343,3 +343,19 @@ class ExtraWhere:
     def as_sql(self, compiler=None, connection=None):
         sqls = ["(%s)" % sql for sql in self.sqls]
         return " AND ".join(sqls), list(self.params or ())
+
+    def relabel_aliases(self, change_map):
+        """
+        Keep raw SQL fragments in sync with alias relabeling performed by
+        the query compiler.
+        """
+        if not change_map:
+            return
+        relabeled = []
+        for sql in self.sqls:
+            for old_alias, new_alias in change_map.items():
+                old_quoted = f'"{old_alias}".'
+                new_quoted = f'"{new_alias}".'
+                sql = sql.replace(old_quoted, new_quoted)
+            relabeled.append(sql)
+        self.sqls = relabeled

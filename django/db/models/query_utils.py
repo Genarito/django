@@ -138,6 +138,22 @@ class Q(tree.Node):
             clone.children.append(child_replacement)
         return clone
 
+    def relabeled_clone(self, change_map):
+        if not change_map:
+            return self
+        clone = self.create(connector=self.connector, negated=self.negated)
+        for child in self.children:
+            if isinstance(child, tuple):
+                lhs, rhs = child
+                if hasattr(rhs, "relabeled_clone"):
+                    rhs = rhs.relabeled_clone(change_map)
+                clone.children.append((lhs, rhs))
+            elif hasattr(child, "relabeled_clone"):
+                clone.children.append(child.relabeled_clone(change_map))
+            else:
+                clone.children.append(child)
+        return clone
+
     def flatten(self):
         """
         Recursively yield this Q object and all subexpressions, in depth-first

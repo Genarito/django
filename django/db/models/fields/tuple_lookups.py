@@ -6,6 +6,7 @@ from django.db.models.expressions import (
     ColPairs,
     Exists,
     Func,
+    OuterCol,
     ResolvedOuterRef,
     Subquery,
     Value,
@@ -74,7 +75,7 @@ class TupleLookupMixin:
             )
 
     def check_rhs_is_supported_expression(self):
-        if not isinstance(self.rhs, (ResolvedOuterRef, Query)):
+        if not isinstance(self.rhs, (ResolvedOuterRef, OuterCol, Query)):
             lhs_str = self.get_lhs_str()
             rhs_cls = self.rhs.__class__.__name__
             raise ValueError(
@@ -384,9 +385,25 @@ class TupleIn(TupleLookupMixin, In):
                 for select in rhs.get_compiler(connection=connection).get_select()[0]
             )
             rhs = rhs.clone()
+            query = compiler.query
+
+            def outer_ref(col):
+                table_name = col.target.model._meta.db_table
+                aliases = query.table_map.get(table_name) or [table_name]
+                outer_alias = aliases[0]
+                rhs.external_aliases[outer_alias] = True
+                return OuterCol(outer_alias, col.target, col.output_field)
+
             rhs.add_q(
-                models.Q(*[Exact(col, val) for col, val in zip(self.lhs, rhs_exprs)])
+                models.Q(
+                    *[
+                        Exact(val, outer_ref(col))
+                        for col, val in zip(self.lhs, rhs_exprs)
+                    ]
+                )
             )
+            rhs.alias_prefix = query.alias_prefix
+            rhs.bump_prefix(query)
             return compiler.compile(Exists(rhs))
         elif not self.rhs_is_direct_value():
             return super(TupleLookupMixin, self).as_sql(compiler, connection)

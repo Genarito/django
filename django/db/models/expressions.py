@@ -253,26 +253,29 @@ class BaseExpression:
     @cached_property
     def contains_aggregate(self):
         return any(
-            expr and expr.contains_aggregate for expr in self.get_source_expressions()
+            expr is not None and expr.contains_aggregate
+            for expr in self.get_source_expressions()
         )
 
     @cached_property
     def contains_over_clause(self):
         return any(
-            expr and expr.contains_over_clause for expr in self.get_source_expressions()
+            expr is not None and expr.contains_over_clause
+            for expr in self.get_source_expressions()
         )
 
     @cached_property
     def contains_column_references(self):
         return any(
-            expr and expr.contains_column_references
+            expr is not None and expr.contains_column_references
             for expr in self.get_source_expressions()
         )
 
     @cached_property
     def contains_subquery(self):
         return any(
-            expr and (getattr(expr, "subquery", False) or expr.contains_subquery)
+            expr is not None
+            and (getattr(expr, "subquery", False) or expr.contains_subquery)
             for expr in self.get_source_expressions()
         )
 
@@ -923,6 +926,9 @@ class F(Combinable):
             replacement = transform_class(replacement)
         return replacement
 
+    def relabeled_clone(self, relabels):
+        return self
+
     def asc(self, **kwargs):
         return OrderBy(self, **kwargs)
 
@@ -950,14 +956,21 @@ class ResolvedOuterRef(F):
     contains_aggregate = False
     contains_over_clause = False
 
-    def as_sql(self, *args, **kwargs):
+    def as_sql(self, compiler, connection):
+        if isinstance(self.name, (Col, ColPairs)):
+            return compiler.compile(self.name)
         raise ValueError(
             "This queryset contains a reference to an outer query and may "
             "only be used in a subquery."
         )
 
     def resolve_expression(self, *args, **kwargs):
-        col = super().resolve_expression(*args, **kwargs)
+        if isinstance(self.name, (Col, ColPairs)):
+            return self
+        try:
+            col = super().resolve_expression(*args, **kwargs)
+        except FieldError:
+            return self
         if col.contains_over_clause:
             raise NotSupportedError(
                 f"Referencing outer query window expression is not supported: "
@@ -1255,6 +1268,17 @@ class RawSQL(Expression):
             query, allow_joins, reuse, summarize, for_save
         )
 
+    def relabeled_clone(self, change_map):
+        """
+        Relabel table aliases in raw SQL to keep them in sync with query joins.
+        """
+        clone = self.copy()
+        sql = clone.sql
+        for old_alias, new_alias in change_map.items():
+            sql = sql.replace(f'"{old_alias}".', f'"{new_alias}".')
+        clone.sql = sql
+        return clone
+
 
 class Star(Expression):
     def __repr__(self):
@@ -1343,6 +1367,15 @@ class Col(Expression):
         ) + self.target.get_db_converters(connection)
 
 
+class OuterCol(Col):
+    """
+    A Col that preserves its alias during subquery relabeling.
+    """
+
+    def relabeled_clone(self, relabels):
+        return self
+
+
 class ColPairs(Expression):
     def __init__(self, alias, targets, sources, output_field):
         super().__init__(output_field=output_field)
@@ -1389,8 +1422,12 @@ class ColPairs(Expression):
         return ", ".join(cols_sql), cols_params
 
     def relabeled_clone(self, relabels):
+        output_field = self.__dict__.get("output_field")
         return self.__class__(
-            relabels.get(self.alias, self.alias), self.targets, self.sources, self.field
+            relabels.get(self.alias, self.alias),
+            self.targets,
+            self.sources,
+            output_field,
         )
 
     def resolve_expression(self, *args, **kwargs):
@@ -1435,6 +1472,9 @@ class Ref(Expression):
         return clone
 
     def as_sql(self, compiler, connection):
+        cte_column_map = getattr(compiler, "cte_column_map", None)
+        if cte_column_map and self.refs in cte_column_map:
+            return connection.ops.quote_name(cte_column_map[self.refs]), []
         return connection.ops.quote_name(self.refs), []
 
     def get_group_by_cols(self):
@@ -1454,9 +1494,16 @@ class SafeRef(Ref):
         return self.source.get_group_by_cols()
 
     def as_sql(self, compiler, connection):
+        if getattr(compiler, "in_where", False) or getattr(compiler, "in_having", False):
+            return compiler.compile(self.source)
+        cte_column_map = getattr(compiler, "cte_column_map", None)
+        if cte_column_map and self.refs in cte_column_map:
+            return connection.ops.quote_name(cte_column_map[self.refs]), []
+        if getattr(compiler, "in_select", False):
+            return compiler.compile(self.source)
         if self.refs in compiler.query.annotation_select:
             return super().as_sql(compiler, connection)
-        return self.source.as_sql(compiler, connection)
+        return compiler.compile(self.source)
 
 
 class ExpressionList(Func):
@@ -1832,6 +1879,26 @@ class Subquery(BaseExpression, Combinable):
     def copy(self):
         clone = super().copy()
         clone.query = clone.query.clone()
+        return clone
+
+    def relabeled_clone(self, relabels):
+        """
+        Keep external alias tracking aligned with renamed aliases in the parent
+        query without relabeling the subquery's own joins.
+        """
+        clone = self.copy()
+        if relabels:
+            clone.query.external_aliases = {
+                relabels.get(alias, alias): aliased
+                for alias, aliased in clone.query.external_aliases.items()
+            }
+            external_change_map = {
+                old: new
+                for old, new in relabels.items()
+                if old not in clone.query.alias_map
+            }
+            if external_change_map:
+                clone.query.change_aliases(external_change_map)
         return clone
 
     @property

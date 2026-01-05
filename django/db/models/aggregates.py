@@ -38,6 +38,22 @@ class AggregateFilter(Func):
     arity = 1
     template = " FILTER (WHERE %(expressions)s)"
 
+    def resolve_expression(
+        self, query=None, allow_joins=True, reuse=None, summarize=False, for_save=False
+    ):
+        from django.db.models.sql.where import WhereNode
+
+        if (
+            query is None
+            and (
+                isinstance(self.condition, WhereNode)
+                or getattr(self.condition, "resolved", False)
+            )
+        ):
+            # Preserve pre-resolved filters so alias relabeling can reuse them.
+            return self.copy()
+        return super().resolve_expression(query, allow_joins, reuse, summarize, for_save)
+
     def as_sql(self, compiler, connection, **extra_context):
         if not connection.features.supports_aggregate_filter_clause:
             raise NotSupportedError(
